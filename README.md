@@ -1,5 +1,7 @@
 # Supply Chain Uncertainty Decision System
 
+**Live Demo:** [baselstrase-sc-opt.streamlit.app](https://baselstrase-sc-opt.streamlit.app/)
+
 An end-to-end supply chain analytics portfolio for turning demand uncertainty into better inventory, service, and financial decisions.
 
 ## Core Question
