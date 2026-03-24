@@ -26,12 +26,10 @@ data/processed/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 
-# Outputs
+# Outputs — commit tables (needed by Streamlit Cloud), ignore large binary figures
 outputs/figures/*
-outputs/tables/*
 outputs/reports/*
 !outputs/figures/.gitkeep
-!outputs/tables/.gitkeep
 !outputs/reports/.gitkeep
 
 # IDE

@@ -3,7 +3,14 @@ app.py — Supply Chain Uncertainty Decision Platform
 Run: streamlit run app.py
 """
 
+import sys
 from pathlib import Path
+
+# Ensure repo root is on sys.path so 'src' is importable on Streamlit Cloud
+ROOT = Path(__file__).parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -11,8 +18,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-# ── Config ─────────────────────────────────────────────────────────────────────
-ROOT   = Path(__file__).parent
+# ── Paths ───────────────────────────────────────────────────────────────────────
 TABLES = ROOT / "outputs" / "tables"
 FIGS   = ROOT / "outputs" / "figures"
 
