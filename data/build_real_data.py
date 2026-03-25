@@ -1,204 +1,206 @@
 """
 build_real_data.py
 ------------------
-Downloads the UCI Online Retail II dataset and transforms it into the
-master_data.csv schema used by all 6 portfolio notebooks.
+Downloads the M5 Forecasting Competition dataset (Walmart grocery / FMCG store
+sales) and transforms it into the master_data.csv schema used by all 6 portfolio
+notebooks.
 
-Run from the repo root:
+Prerequisites
+-------------
+    pip install kaggle
+    # Get your API token from https://www.kaggle.com/settings  (API section)
+    # Save the downloaded kaggle.json to  ~/.kaggle/kaggle.json
+    # On Windows: C:\\Users\\<you>\\.kaggle\\kaggle.json
+
+Run from repo root:
     python data/build_real_data.py
 
 Outputs:
-    data/raw/online_retail_II.xlsx        (raw download, cached)
-    data/processed/master_data.csv        (ready for notebooks)
+    data/raw/m5/           (raw M5 files, cached)
+    data/processed/master_data.csv
 """
 
-import io
+import subprocess
 import zipfile
-import requests
 import numpy as np
 import pandas as pd
 from pathlib import Path
 from scipy.stats import norm
 
-# ── Paths ──────────────────────────────────────────────────────────────────────
-ROOT      = Path(__file__).parent.parent
-RAW_DIR   = ROOT / "data" / "raw"
-PROC_DIR  = ROOT / "data" / "processed"
-RAW_XLSX  = RAW_DIR  / "online_retail_II.xlsx"
-OUT_CSV   = PROC_DIR / "master_data.csv"
+# ── Paths ───────────────────────────────────────────────────────────────────────
+ROOT     = Path(__file__).parent.parent
+RAW_DIR  = ROOT / "data" / "raw" / "m5"
+PROC_DIR = ROOT / "data" / "processed"
+OUT_CSV  = PROC_DIR / "master_data.csv"
 
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 PROC_DIR.mkdir(parents=True, exist_ok=True)
 
-# ── Parameters ─────────────────────────────────────────────────────────────────
-DOWNLOAD_URL   = "https://archive.ics.uci.edu/static/public/502/online+retail+ii.zip"
-TOP_N_SKUS     = 50      # keep highest-volume SKUs
-TOP_N_LOCS     = 4       # keep highest-volume countries
-MIN_WEEKS      = 40      # drop SKU-location pairs with fewer weeks of data
+# ── Parameters ──────────────────────────────────────────────────────────────────
+DEPT_ID        = "FOODS_3"       # Grocery department — continuous weekly demand
+TOP_N_ITEMS    = 50              # top SKUs by total units sold
+STORES         = ["CA_1", "CA_2", "TX_1", "TX_2", "WI_1"]
+DATE_START     = "2013-01-07"    # ~3 years of weekly data
 HOLDING_RATE   = 0.20
-MARGIN_RATE    = 0.30    # margin = price × MARGIN_RATE
-EXPEDITE_MULT  = 1.50    # shortage cost = margin × EXPEDITE_MULT
+MARGIN_RATE    = 0.30
+EXPEDITE_MULT  = 1.50
+SL_BY_ABC      = {"A": 0.95, "B": 0.90, "C": 0.85}
 
-# Lead-time assumptions by country (days)
-LT_BY_COUNTRY = {
-    "United Kingdom": {"mean": 7,  "std": 1},
-    "Germany":        {"mean": 14, "std": 3},
-    "France":         {"mean": 14, "std": 3},
-    "Netherlands":    {"mean": 10, "std": 2},
-    "default":        {"mean": 21, "std": 5},
+# Lead-time assumptions by store location (days)
+LT_BY_STORE = {
+    "CA_1": {"mean":  5, "std": 1},
+    "CA_2": {"mean":  5, "std": 1},
+    "TX_1": {"mean": 10, "std": 2},
+    "TX_2": {"mean": 10, "std": 2},
+    "WI_1": {"mean": 14, "std": 3},
 }
-
-# Service target by ABC class
-SL_BY_ABC = {"A": 0.95, "B": 0.90, "C": 0.85}
 
 RNG = np.random.default_rng(42)
 
 
-# ── Step 1: Download ───────────────────────────────────────────────────────────
-def download_raw() -> None:
-    if RAW_XLSX.exists():
-        print(f"Raw file already cached: {RAW_XLSX}")
+# ── Step 1: Download ────────────────────────────────────────────────────────────
+def download_m5() -> None:
+    if (RAW_DIR / "calendar.csv").exists():
+        print("M5 files already cached.")
         return
-    print(f"Downloading UCI Online Retail II (~44 MB)...")
-    resp = requests.get(DOWNLOAD_URL, timeout=120, stream=True)
-    resp.raise_for_status()
-    total = int(resp.headers.get("content-length", 0))
-    data  = b""
-    for chunk in resp.iter_content(chunk_size=65536):
-        data += chunk
-        if total:
-            pct = len(data) / total * 100
-            print(f"  {pct:.0f}%", end="\r")
-    print(f"  Downloaded {len(data)/1e6:.1f} MB")
-    with zipfile.ZipFile(io.BytesIO(data)) as z:
-        xlsx_name = next(n for n in z.namelist() if n.endswith(".xlsx"))
-        z.extract(xlsx_name, RAW_DIR)
-        extracted = RAW_DIR / xlsx_name
-        if extracted != RAW_XLSX:
-            extracted.rename(RAW_XLSX)
-    print(f"Saved: {RAW_XLSX}")
+
+    print("Downloading M5 dataset via Kaggle API (~110 MB)...")
+    try:
+        subprocess.run(
+            ["kaggle", "competitions", "download",
+             "-c", "m5-forecasting-accuracy", "-p", str(RAW_DIR)],
+            check=True,
+        )
+    except FileNotFoundError:
+        raise SystemExit(
+            "\nkaggle CLI not found.\n"
+            "  pip install kaggle\n"
+            "  Then save your API token to ~/.kaggle/kaggle.json\n"
+            "  (get it from https://www.kaggle.com/settings > API > Create New Token)"
+        )
+
+    zip_path = RAW_DIR / "m5-forecasting-accuracy.zip"
+    if zip_path.exists():
+        print("Extracting...")
+        with zipfile.ZipFile(zip_path) as z:
+            z.extractall(RAW_DIR)
+        print(f"Extracted to {RAW_DIR}")
 
 
-# ── Step 2: Load and clean raw data ───────────────────────────────────────────
-def load_and_clean() -> pd.DataFrame:
-    print("Loading Excel sheets (this takes ~30s)...")
-    sheets = []
-    for sheet in ["Year 2009-2010", "Year 2010-2011"]:
-        try:
-            s = pd.read_excel(RAW_XLSX, sheet_name=sheet, engine="openpyxl")
-            sheets.append(s)
-            print(f"  Loaded '{sheet}': {len(s):,} rows")
-        except Exception as e:
-            print(f"  Skipped '{sheet}': {e}")
-    df = pd.concat(sheets, ignore_index=True)
-
-    # Normalise column names
-    df.columns = [c.strip() for c in df.columns]
-
-    # Drop cancellations (InvoiceNo starts with C)
-    df = df[~df["Invoice"].astype(str).str.startswith("C")]
-
-    # Drop bad rows
-    df = df.dropna(subset=["StockCode", "Quantity", "Price", "InvoiceDate", "Country"])
-    df = df[df["Quantity"] > 0]
-    df = df[df["Price"] > 0]
-
-    # Remove non-product codes (postage, samples, bank charges, etc.)
-    bad_codes = {"POST", "D", "M", "BANK CHARGES", "PADS", "DOT", "AMAZONFEE",
-                 "S", "CRUK", "C2", "DCGS0076P", "gift_0001_40"}
-    df = df[~df["StockCode"].astype(str).str.upper().isin(bad_codes)]
-    df = df[df["StockCode"].astype(str).str.match(r"^\d{5}")]
-
-    # Parse dates
-    df["InvoiceDate"] = pd.to_datetime(df["InvoiceDate"], dayfirst=True, errors="coerce")
-    df = df.dropna(subset=["InvoiceDate"])
-
-    print(f"Clean rows: {len(df):,}")
-    return df
+# ── Step 2: Load raw files ──────────────────────────────────────────────────────
+def load_m5() -> tuple:
+    print("Loading M5 files...")
+    cal    = pd.read_csv(RAW_DIR / "calendar.csv",              parse_dates=["date"])
+    sales  = pd.read_csv(RAW_DIR / "sales_train_evaluation.csv")
+    prices = pd.read_csv(RAW_DIR / "sell_prices.csv")
+    print(f"  calendar:  {len(cal):,} rows")
+    print(f"  sales:     {len(sales):,} rows")
+    print(f"  prices:    {len(prices):,} rows")
+    return cal, sales, prices
 
 
-# ── Step 3: Filter to top SKUs and locations ───────────────────────────────────
-def filter_top(df: pd.DataFrame) -> pd.DataFrame:
-    top_skus = (
-        df.groupby("StockCode")["Quantity"].sum()
-        .nlargest(TOP_N_SKUS).index.tolist()
+# ── Step 3: Filter, melt, aggregate ────────────────────────────────────────────
+def filter_and_reshape(cal: pd.DataFrame, sales: pd.DataFrame,
+                       prices: pd.DataFrame) -> pd.DataFrame:
+    # Filter to target department + selected stores
+    mask = (sales["dept_id"] == DEPT_ID) & (sales["store_id"].isin(STORES))
+    foods = sales[mask].copy()
+
+    # Identify day-columns then select top-N items by total units
+    d_cols = [c for c in foods.columns if c.startswith("d_")]
+    top_items = (
+        foods.groupby("item_id")[d_cols].sum().sum(axis=1)
+        .nlargest(TOP_N_ITEMS).index
     )
-    top_locs = (
-        df.groupby("Country")["Quantity"].sum()
-        .nlargest(TOP_N_LOCS).index.tolist()
+    foods = foods[foods["item_id"].isin(top_items)]
+    print(f"Filtered: {foods['item_id'].nunique()} items x {foods['store_id'].nunique()} stores")
+
+    # Melt wide -> long (only selected items — much smaller)
+    id_cols = ["item_id", "store_id"]
+    long = foods[id_cols + d_cols].melt(
+        id_vars=id_cols, var_name="d", value_name="daily_sales"
     )
-    df = df[df["StockCode"].isin(top_skus) & df["Country"].isin(top_locs)]
-    print(f"After filter: {len(df):,} rows | {df['StockCode'].nunique()} SKUs | {df['Country'].nunique()} countries")
-    return df
 
+    # Join calendar to get date + week number + event flags
+    cal_sub = cal[["d", "date", "wm_yr_wk", "event_type_1", "event_type_2"]].copy()
+    long = long.merge(cal_sub, on="d")
+    long = long[long["date"] >= DATE_START]
 
-# ── Step 4: Aggregate to weekly demand per SKU-location ───────────────────────
-def aggregate_weekly(df: pd.DataFrame) -> pd.DataFrame:
-    # Use Monday-anchored week start (floor to Monday)
-    df["week"] = df["InvoiceDate"] - pd.to_timedelta(df["InvoiceDate"].dt.dayofweek, unit="D")
-    df["week"] = df["week"].dt.normalize()
+    # Monday-anchored week floor
+    long["week"] = long["date"] - pd.to_timedelta(long["date"].dt.dayofweek, unit="D")
 
-    agg = (
-        df.groupby(["StockCode", "Country", "week"])
+    # Flag weeks that contain a calendar event (promo) or are in Nov/Dec (holiday)
+    long["has_event"]   = long["event_type_1"].notna() | long["event_type_2"].notna()
+    long["is_holiday"]  = long["date"].dt.month.isin([11, 12])
+
+    # Aggregate daily -> weekly
+    weekly = (
+        long.groupby(["item_id", "store_id", "week", "wm_yr_wk"])
         .agg(
-            actual_demand=("Quantity",  "sum"),
-            avg_price    =("Price",     "mean"),
-            n_invoices   =("Invoice",   "nunique"),
+            actual_demand=("daily_sales",  "sum"),
+            promo_flag   =("has_event",    "max"),
+            holiday_flag =("is_holiday",   "max"),
         )
         .reset_index()
     )
+    weekly["promo_flag"]   = weekly["promo_flag"].astype(int)
+    weekly["holiday_flag"] = weekly["holiday_flag"].astype(int)
 
-    # Build full date spine (Monday steps)
-    all_weeks = pd.date_range(agg["week"].min(), agg["week"].max(), freq="7D")
-    skus = agg["StockCode"].unique()
-    locs = agg["Country"].unique()
-
-    spine = pd.DataFrame(
-        [(s, l, w) for s in skus for l in locs for w in all_weeks],
-        columns=["StockCode", "Country", "week"],
+    # Join sell prices (wm_yr_wk links weeks to prices)
+    prices_sub = prices[
+        prices["store_id"].isin(STORES) & prices["item_id"].isin(top_items)
+    ].copy()
+    weekly = weekly.merge(
+        prices_sub[["store_id", "item_id", "wm_yr_wk", "sell_price"]],
+        on=["store_id", "item_id", "wm_yr_wk"],
+        how="left",
     )
 
-    weekly = spine.merge(agg, on=["StockCode", "Country", "week"], how="left")
-    weekly["actual_demand"] = weekly["actual_demand"].fillna(0)
-    weekly["n_invoices"]    = weekly["n_invoices"].fillna(0)
-
-    # Forward-fill price per SKU (use global SKU mean as fallback)
-    sku_mean_price = agg.groupby("StockCode")["avg_price"].mean()
-    weekly["avg_price"] = (
-        weekly.groupby("StockCode")["avg_price"]
+    # Forward/back fill price per SKU-location, fallback to item mean
+    weekly = weekly.sort_values(["item_id", "store_id", "week"])
+    weekly["sell_price"] = (
+        weekly.groupby(["item_id", "store_id"])["sell_price"]
         .transform(lambda s: s.ffill().bfill())
     )
-    weekly["avg_price"] = weekly["avg_price"].fillna(
-        weekly["StockCode"].map(sku_mean_price)
+    weekly["sell_price"] = weekly["sell_price"].fillna(
+        weekly.groupby("item_id")["sell_price"].transform("mean")
     )
 
-    # Drop pairs with fewer than MIN_WEEKS of observed data
-    obs_counts = (
-        agg.groupby(["StockCode", "Country"])["actual_demand"]
-        .count()
-        .reset_index(name="obs")
+    # Build full date spine to ensure no gaps
+    all_weeks = pd.date_range(weekly["week"].min(), weekly["week"].max(), freq="7D")
+    spine = pd.DataFrame(
+        [(i, s, w) for i in top_items for s in STORES for w in all_weeks],
+        columns=["item_id", "store_id", "week"],
     )
-    weekly = weekly.merge(obs_counts, on=["StockCode", "Country"])
-    weekly = weekly[weekly["obs"] >= MIN_WEEKS].drop(columns="obs")
+    weekly = spine.merge(
+        weekly.drop(columns="wm_yr_wk"), on=["item_id", "store_id", "week"], how="left"
+    )
+    weekly["actual_demand"] = weekly["actual_demand"].fillna(0).astype(int)
+    weekly["promo_flag"]    = weekly["promo_flag"].fillna(0).astype(int)
+    weekly["holiday_flag"]  = weekly["holiday_flag"].fillna(0).astype(int)
+    weekly["sell_price"]    = (
+        weekly.groupby(["item_id", "store_id"])["sell_price"]
+        .transform(lambda s: s.ffill().bfill())
+    )
 
-    print(f"Weekly grid: {len(weekly):,} rows | {weekly['StockCode'].nunique()} SKUs | {weekly['Country'].nunique()} countries")
+    print(f"Weekly grid: {len(weekly):,} rows | {weekly['item_id'].nunique()} items | {weekly['store_id'].nunique()} stores | {weekly['week'].nunique()} weeks")
     return weekly
 
 
-# ── Step 5: Derive forecast ────────────────────────────────────────────────────
+# ── Step 4: Derive forecast (exponential smoothing + realistic noise) ───────────
 def add_forecast(weekly: pd.DataFrame, alpha: float = 0.25) -> pd.DataFrame:
-    """Exponential smoothing per SKU-location + systematic bias for realism."""
     forecasts = []
-    for (sku, loc), grp in weekly.groupby(["StockCode", "Country"]):
+    for (item, store), grp in weekly.groupby(["item_id", "store_id"]):
         grp = grp.sort_values("week")
         d   = grp["actual_demand"].values.astype(float)
         f   = np.zeros_like(d)
         f[0] = d[0]
         for i in range(1, len(d)):
-            f[i] = alpha * d[i-1] + (1 - alpha) * f[i-1]
-        # Add realistic bias noise
-        bias  = RNG.uniform(-0.08, 0.08)
-        noise = RNG.normal(0, d.std() * 0.12, size=len(d))
+            f[i] = alpha * d[i - 1] + (1 - alpha) * f[i - 1]
+        # Systematic bias + noise — drives WAPE variance across SKUs
+        bias  = RNG.uniform(-0.12, 0.12)
+        sigma = max(d.std(), 0.1) * 0.18
+        noise = RNG.normal(0, sigma, size=len(d))
         f     = np.clip(f * (1 + bias) + noise, 0, None).round(0)
         forecasts.append(pd.Series(f, index=grp.index))
 
@@ -206,98 +208,90 @@ def add_forecast(weekly: pd.DataFrame, alpha: float = 0.25) -> pd.DataFrame:
     return weekly
 
 
-# ── Step 6: Derive financial and policy fields ────────────────────────────────
+# ── Step 5: Derive all policy and financial fields ──────────────────────────────
 def derive_fields(weekly: pd.DataFrame) -> pd.DataFrame:
-    """ABC/XYZ, lead times, costs, SS, ROP, inventory position."""
 
-    # ── ABC classification ─────────────────────────────────────
-    sku_vol = (
-        weekly.groupby("StockCode")["actual_demand"].sum()
+    # ── ABC: cumulative revenue share by item (across all stores) ──
+    item_rev = (
+        weekly.assign(revenue=weekly["actual_demand"] * weekly["sell_price"].fillna(1))
+        .groupby("item_id")["revenue"].sum()
         .sort_values(ascending=False)
     )
-    cum_pct = sku_vol.cumsum() / sku_vol.sum()
-    abc_map = {}
-    for sku in sku_vol.index:
-        p = cum_pct[sku]
-        abc_map[sku] = "A" if p <= 0.80 else ("B" if p <= 0.95 else "C")
+    cum_pct = item_rev.cumsum() / item_rev.sum()
+    abc_map = {
+        item: ("A" if cum_pct[item] <= 0.80 else ("B" if cum_pct[item] <= 0.95 else "C"))
+        for item in item_rev.index
+    }
 
-    # ── XYZ classification ─────────────────────────────────────
-    sku_cv = weekly.groupby("StockCode")["actual_demand"].agg(
-        lambda x: x.std() / x.mean() if x.mean() > 0 else 0
+    # ── XYZ: coefficient of variation per item ──
+    item_cv = weekly.groupby("item_id")["actual_demand"].agg(
+        lambda x: (x.std() / x.mean()) if x.mean() > 0 else 0
     )
-    xyz_map = {}
-    for sku, cv in sku_cv.items():
-        xyz_map[sku] = "X" if cv <= 0.5 else ("Y" if cv <= 1.0 else "Z")
+    xyz_map = {
+        item: ("X" if cv <= 0.5 else ("Y" if cv <= 1.0 else "Z"))
+        for item, cv in item_cv.items()
+    }
 
-    weekly["abc_class"]     = weekly["StockCode"].map(abc_map)
-    weekly["xyz_class"]     = weekly["StockCode"].map(xyz_map)
-    weekly["cv"]            = weekly["StockCode"].map(sku_cv).round(3)
-    weekly["product_family"]= "FAM_" + weekly["abc_class"]
+    weekly["abc_class"]      = weekly["item_id"].map(abc_map)
+    weekly["xyz_class"]      = weekly["item_id"].map(xyz_map)
+    weekly["cv"]             = weekly["item_id"].map(item_cv).round(3)
+    # product_family: e.g. FOODS_3 -> strip last segment so items group nicely
+    weekly["product_family"] = weekly["item_id"].str.rsplit("_", n=1).str[0]
 
-    # ── Rename core fields ─────────────────────────────────────
+    # ── Rename core fields ──
     weekly = weekly.rename(columns={
-        "StockCode": "sku",
-        "Country":   "location",
-        "week":      "date",
+        "item_id":    "sku",
+        "store_id":   "location",
+        "week":       "date",
+        "sell_price": "unit_cost",
     })
     weekly["date"] = weekly["date"].dt.date
 
-    # ── Financial fields ───────────────────────────────────────
-    unit_price = (
-        weekly.groupby("sku")["avg_price"].mean().rename("avg_price_sku")
+    # ── Financial ──
+    weekly["unit_cost"]              = weekly["unit_cost"].round(2)
+    weekly["unit_margin"]            = (weekly["unit_cost"] * MARGIN_RATE).round(2)
+    weekly["holding_cost_rate"]      = HOLDING_RATE
+    weekly["shortage_cost_per_unit"] = (weekly["unit_margin"] * EXPEDITE_MULT).round(2)
+    weekly["service_target"]         = weekly["abc_class"].map(SL_BY_ABC)
+
+    # ── Lead times ──
+    weekly["lead_time_mean"] = weekly["location"].map(
+        lambda l: LT_BY_STORE.get(l, {"mean": 7})["mean"]
     )
-    weekly["unit_cost"]   = weekly["sku"].map(unit_price).round(2)
-    weekly["unit_margin"] = (weekly["unit_cost"] * MARGIN_RATE).round(2)
-    weekly["holding_cost_rate"]    = HOLDING_RATE
-    weekly["shortage_cost_per_unit"]= (weekly["unit_margin"] * EXPEDITE_MULT).round(2)
+    weekly["lead_time_std"]  = weekly["location"].map(
+        lambda l: LT_BY_STORE.get(l, {"std": 2})["std"]
+    )
 
-    # ── Service target ─────────────────────────────────────────
-    weekly["service_target"] = weekly["abc_class"].map(SL_BY_ABC)
-
-    # ── Lead-time ──────────────────────────────────────────────
-    def get_lt(loc, key):
-        p = LT_BY_COUNTRY.get(loc, LT_BY_COUNTRY["default"])
-        return p[key]
-
-    weekly["lead_time_mean"] = weekly["location"].apply(lambda l: get_lt(l, "mean"))
-    weekly["lead_time_std"]  = weekly["location"].apply(lambda l: get_lt(l, "std"))
-
-    # ── Promo / holiday flags ──────────────────────────────────
-    weekly["date_dt"]      = pd.to_datetime(weekly["date"])
-    weekly["promo_flag"]   = (weekly["n_invoices"].fillna(0) > weekly.groupby("sku")["n_invoices"].transform("mean") * 1.5).astype(int)
-    weekly["holiday_flag"] = ((weekly["date_dt"].dt.month == 12) & (weekly["date_dt"].dt.day >= 20)).astype(int)
-    weekly = weekly.drop(columns=["date_dt"])
-
-    # ── Safety stock and ROP (compute per SKU-location, merge back) ──
+    # ── Safety stock + reorder point ──
     ss_rop_rows = []
     for (sku, loc), grp in weekly.groupby(["sku", "location"]):
-        d      = grp["actual_demand"].values
+        d      = grp["actual_demand"].values.astype(float)
         avg_d  = d.mean()
         std_d  = d.std() if len(d) > 1 else 0
         sl     = grp["service_target"].iloc[0]
-        lt     = grp["lead_time_mean"].iloc[0] / 7
+        lt     = grp["lead_time_mean"].iloc[0] / 7      # convert days -> weeks
         lt_std = grp["lead_time_std"].iloc[0]  / 7
         z      = norm.ppf(sl)
-        ss     = max(z * np.sqrt(lt * std_d**2 + avg_d**2 * lt_std**2), 0)
+        ss     = max(z * np.sqrt(lt * std_d ** 2 + avg_d ** 2 * lt_std ** 2), 0)
         rop    = avg_d * lt + ss
         ss_rop_rows.append({"sku": sku, "location": loc,
-                             "safety_stock": round(ss, 0),
+                             "safety_stock":  round(ss, 0),
                              "reorder_point": round(rop, 0)})
 
     ss_rop_df = pd.DataFrame(ss_rop_rows)
     weekly    = weekly.merge(ss_rop_df, on=["sku", "location"])
 
-    # ── Inventory position (simulate around safety stock) ──────
+    # ── Simulated inventory position (centred around safety stock) ──
     ss_vals   = weekly["safety_stock"].clip(lower=1).values
-    weekly["on_hand"]      = np.round(RNG.uniform(ss_vals * 0.8, ss_vals * 2.5), 0)
+    weekly["on_hand"]       = np.round(RNG.uniform(ss_vals * 0.8, ss_vals * 2.5), 0)
     safe_cost = weekly["unit_cost"].fillna(1.0).clip(lower=0.01, upper=500).values
-    weekly["on_order"]     = np.round(RNG.uniform(0, safe_cost * 50), 0)
-    weekly["stockout_flag"]= (weekly["on_hand"] < weekly["actual_demand"]).astype(int)
+    weekly["on_order"]      = np.round(RNG.uniform(0, safe_cost * 50), 0)
+    weekly["stockout_flag"] = (weekly["on_hand"] < weekly["actual_demand"]).astype(int)
 
     return weekly
 
 
-# ── Step 7: Final schema alignment ────────────────────────────────────────────
+# ── Schema ──────────────────────────────────────────────────────────────────────
 SCHEMA_COLS = [
     "sku", "location", "date",
     "actual_demand", "forecast",
@@ -313,31 +307,45 @@ SCHEMA_COLS = [
 ]
 
 
-def main():
-    print("=== UCI Online Retail II -> Portfolio Master Data ===\n")
-    download_raw()
+# ── Main ────────────────────────────────────────────────────────────────────────
+def main() -> None:
+    print("=== M5 Walmart Grocery (FOODS_3) -> Portfolio Master Data ===\n")
+    download_m5()
 
-    df      = load_and_clean()
-    df      = filter_top(df)
-    weekly  = aggregate_weekly(df)
-    weekly  = add_forecast(weekly)
-    weekly  = derive_fields(weekly)
+    cal, sales, prices = load_m5()
+    weekly = filter_and_reshape(cal, sales, prices)
+    weekly = add_forecast(weekly)
+    weekly = derive_fields(weekly)
 
-    # Keep only schema columns that exist
     cols = [c for c in SCHEMA_COLS if c in weekly.columns]
     out  = weekly[cols].sort_values(["sku", "location", "date"]).reset_index(drop=True)
 
     out.to_csv(OUT_CSV, index=False)
 
-    print(f"\nSaved: {OUT_CSV}")
-    print(f"Rows:  {len(out):,}")
-    print(f"SKUs:  {out['sku'].nunique()}")
-    print(f"Locs:  {out['location'].nunique()}")
-    print(f"Weeks: {out['date'].nunique()}")
-    print(f"Date range: {out['date'].min()} to {out['date'].max()}")
+    print(f"\nSaved:      {OUT_CSV}")
+    print(f"Rows:       {len(out):,}")
+    print(f"SKUs:       {out['sku'].nunique()}")
+    print(f"Locations:  {out['location'].nunique()}")
+    print(f"Weeks:      {out['date'].nunique()}")
+    print(f"Date range: {out['date'].min()} -> {out['date'].max()}")
     print()
-    print("ABC/XYZ breakdown:")
-    print(out.drop_duplicates(["sku","location"]).groupby(["abc_class","xyz_class"]).size().rename("sku_locs").to_string())
+    print("ABC/XYZ breakdown (SKU-location pairs):")
+    print(
+        out.drop_duplicates(["sku", "location"])
+        .groupby(["abc_class", "xyz_class"])
+        .size()
+        .rename("count")
+        .to_string()
+    )
+    print()
+    print("WAPE by SKU sample (first 10):")
+    wape_rows = []
+    for (sku, loc), grp in list(out.groupby(["sku", "location"]))[:10]:
+        act = grp["actual_demand"].values.astype(float)
+        fct = grp["forecast"].values.astype(float)
+        wape = np.abs(act - fct).sum() / (act.sum() + 1e-9) * 100
+        wape_rows.append({"sku": sku, "location": loc, "WAPE_%": round(wape, 1)})
+    print(pd.DataFrame(wape_rows).to_string(index=False))
 
 
 if __name__ == "__main__":
